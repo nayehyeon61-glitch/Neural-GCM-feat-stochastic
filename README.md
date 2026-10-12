@@ -1,16 +1,19 @@
-# NeuralGCM + spatial statistical memory
+# NeuralGCM + recurrent manifold memory
 
 An executable research baseline combining the **real pretrained NeuralGCM
-forecast recurrence** with a learned, causal memory closure. Climate Manifold
-spatial statistics can initialize that memory from observations **strictly
-before** a forecast origin.
+forecast recurrence** with a learned stochastic latent transition and causal
+memory closure. Climate Manifold observations initialize a spatial memory and
+the latent at forecast origin; subsequent latents evolve as an explicit
+`z_0 -> z_1 -> ...` conditional stochastic chain.
 
 **Status:** implementation and numerical/interface validation, not a trained
 weather model or demonstrated climate improvement. No trained Climate Manifold
 weights or production NeuralGCM checkpoint are included. The official bundled
 NeuralGCM toy fixture is used only to validate integration.
 
-[한국어 설계와 실행 안내](docs/GUIDE_KO.md) · [Memory 구조와 코드 점검](docs/MEMORY_AUDIT_KO.md) · [Equations and scope](docs/DESIGN.md)
+[한국어 실행 안내](docs/GUIDE_KO.md) · [Recurrent latent 구현 설명](docs/RECURRENT_LATENT_KO.md) · [Equations and scope](docs/DESIGN.md) · [이전 버전 점검](docs/MEMORY_AUDIT_KO.md)
+
+![Recurrent manifold training architecture](docs/figures/recurrent_manifold_training.png)
 
 ## What is implemented
 
@@ -21,9 +24,14 @@ NeuralGCM toy fixture is used only to validate integration.
   Sample the **joint OU endpoint and time integral**, including their covariance.
 - Exact JAX port of the source spatial encoder, preserving its trained
   normalization, field order, optional information encoder and variable fusion.
-- Causal observed-spatial-history initialization. Forecast-time memory is driven
-  by native temperature variations; unavailable surface diagnostics are never
-  replaced with lowest-model-level fields.
+- A learned Gaussian transition conditioned on the current source latent,
+  native temperature and separate spatial memory. Each internal step carries
+  its sampled latent forward and uses the current latent in the thermal closure.
+- Distinct spatial and closure memory states. Historical spatial initialization
+  preserves thermal warmup and OU state. Source observations at the exact
+  forecast origin initialize `z_0`; future observations are labels only.
+- Joint field and latent ensemble scoring at observation times. The future
+  latent trajectory is freely rolled out, never overwritten by teacher labels.
 - Frozen-base differentiable multi-step training, temporal split, ensemble CRPS,
   RMSE, spread, bias and mean-drift evaluation. Explicit base-only comparison.
 
@@ -41,6 +49,7 @@ source .venv/bin/activate
 python -m pip install -e '.[test,export,netcdf]'
 python -m pytest -q
 python scripts/smoke_neuralgcm.py
+python scripts/smoke_neuralgcm.py --recurrent-latent
 ```
 
 The smoke script executes the official NeuralGCM toy checkpoint, checks exact
@@ -77,6 +86,11 @@ See `python scripts/<script>.py --help` for exact arguments.
    `export_spatial.py`, prepare past observed source fields with
    `prepare_spatial_history.py`, and pass `--spatial-history` to train/evaluate.
    Train the source encoder and its normalizations on training data only.
+   Recurrent mode is the training default when history is supplied. Its training
+   artifact must also contain exact origin/future observation timestamps for
+   initialization and latent supervision. Evaluation needs history only through
+   each origin. `--spatial-mode initialization` explicitly selects the previous
+   initialization-only model; old saved checkpoints retain that behavior.
 
 There is no silently generated source checkpoint. The source repository has
 code but no tracked trained weights. Its usual surface inputs are
@@ -89,6 +103,7 @@ valid connection without that substitution.
 | File | Responsibility |
 |---|---|
 | `src/ngcm_memory/closure.py` | Exact auxiliary memory/OU integration |
+| `src/ngcm_memory/latent.py` | Conditional Gaussian latent transition and separate spatial memory |
 | `src/ngcm_memory/neuralgcm_adapter.py` | Real NeuralGCM state, units, and spectral correction |
 | `src/ngcm_memory/spatial.py` | Exact source encoder JAX inference/export |
 | `src/ngcm_memory/features.py` | Causal source history and explicit latent regridding |
@@ -100,7 +115,8 @@ valid connection without that substitution.
 
 Train independent base/memory/noise/full ablations with the same temporal
 partitions, forcing policy, resolution, forecast starts and ensemble size.
-Compare native-temperature memory against spatial-initialized memory. Keep
+Compare native-temperature memory, spatial-initialized memory and recurrent
+latent memory. Keep
 source encoder selection/normalization independent of the held-out period.
 Use multiple seeds and report lead-dependent CRPS/RMSE/spread and climate
 mean/variance, spectra and budget drift over longer runs. The supplied metrics
@@ -111,3 +127,7 @@ Temperature-only corrections do not enforce moist-energy conservation, do not
 provide an ocean/land model, and do not prove out-of-distribution climate skill.
 Base diagnostic fields are not recomputed by the outer correction; do not use
 them as closure-consistent precipitation or energy diagnostics.
+The latent transition is supervised state-space modeling, not reinforcement
+learning, and Gaussian latent noise is not guaranteed to remain on a geometric
+manifold. Neither a longer configured memory nor passing software tests proves
+seasonal forecast skill.

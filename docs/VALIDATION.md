@@ -11,9 +11,10 @@ Offline source equivalence additionally used Torch 2.14.1+cpu.
 
 ## Automated tests
 
-After the memory audit and stale-history fix, `python -m pytest -q`:
-**76 passed** in 25.88 seconds, with one upstream Optax deprecation warning.
-The targeted history/source suite also passed: **23 passed**.
+After recurrent latent integration, `python -m pytest -q`: **104 passed** in
+30.79 seconds, with two occurrences of an upstream Optax deprecation warning.
+The previous initialization-only audit had 76 passing tests. New coverage
+includes latent-chain moments, causal sequence supervision and compatibility.
 
 | Area | Checks |
 |---|---|
@@ -23,6 +24,8 @@ The targeted history/source suite also passed: **23 passed**.
 | Source history | Real prepare/load contract, past-only selection, future/origin perturbation invariance, periodic regrid, nonzero history influence, stale-tail/internal-gap rejection, explicit irregular cadence, single-sample contract and shared origin filtering |
 | Data preparation | Actual Dinosaur conservative regrid, correct pressure/units, missing fields/levels/forcings and timestamp rejection |
 | Training/scoring | Causal rollout, corrected multi-step derivatives, optimizer update, safe checkpoint roundtrip, validation/test exclusion, empirical/fair CRPS and drift metrics |
+| Recurrent latent | Conditional Gaussian moments, small-step variance, accumulated two-step innovations/covariance, exact past-memory sum, source-latent influence on later temperature, independent RNG and disabled passthrough |
+| Latent training | Future label changes affect loss but not predictions, exact origin/lead matching, joint objective and model-grid quadrature, warmup path, old/new checkpoint schemas, evaluation without future source latents |
 
 ## Actual NeuralGCM integration
 
@@ -56,6 +59,36 @@ matched dates/seeds and finite JSON metrics.
 
 These synthetic inputs/checkpoints/results are ignored under `runs/` and are
 not published as trained models or forecast benchmarks.
+
+## Recurrent latent integration (v0.2)
+
+`python scripts/smoke_neuralgcm.py --recurrent-latent` completed two actual
+internal NeuralGCM steps (32 sigma levels, 128 x 64 nodes, 1 hour per step),
+using an explicitly synthetic two-channel initial latent:
+
+- Disabled adapter remained bitwise identical to the unmodified base forecast.
+- Corrected decoded fields were finite.
+- Total physical-field-loss gradient norm: approximately `1.10451e-3`.
+- The latent-transition subtree's gradient norm **from the later physical
+  temperature loss alone** was approximately `2.37628e-6`. No latent-label loss
+  was used in that smoke check, so the test establishes the actual path from
+  generated latent to subsequent physical prediction.
+
+The actual training CLI also completed one optimizer update and validation
+with two members and two hourly leads on the existing synthetic repeated-field
+dataset. Joint physical/latent objective and gradients were finite; gradient
+norm was approximately `3.95489e-3`. Validation reported its physical and latent
+components separately and saved a recurrent NPZ checkpoint. This is a CLI
+connectivity check, not learned Climate Manifold weights or a skill estimate.
+
+The evaluation CLI restored that checkpoint on later synthetic test times.
+Its source-history artifact was truncated **exactly at the tested origin**;
+the subsequent two forecast leads still completed with finite metrics.
+This checks that future source labels are not an inference requirement.
+
+`scripts/render_architecture.py` generated the architecture PNG and SVG.
+The rendered figure was inspected and its initialization, recurrent-state and
+training-label routes were checked against the implemented code.
 
 ## Not validated
 

@@ -1,5 +1,10 @@
 # Manifold와 memory 구현 점검 — 2026-10-12
 
+> 이 문서는 `d2c2ab8`의 **초기화 전용 버전**을 점검한 기록이다. 이후의
+> recurrent latent 수정은 [RECURRENT_LATENT_KO.md](RECURRENT_LATENT_KO.md)를
+> 참고한다. 새 버전은 아래의 입력 0 전환·memory 대체 한계를 수정했으며,
+> 이 기록은 `--spatial-mode initialization` 비교 모델의 설명으로 남긴다.
+
 현재 구현은 **기존 spatial encoder로 과거 관측의 공간 정보를 추출해 memory를
 초기화하고, NeuralGCM 예측 중 온도 보정항으로 사용하는 연구용 baseline**이다.
 실제 장기 예측 향상을 확인한 학습 모델은 아직 아니다.

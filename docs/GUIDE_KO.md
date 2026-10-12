@@ -1,7 +1,7 @@
-# NeuralGCM에 공간 통계 memory를 연결한 첫 구현
+# NeuralGCM + recurrent manifold memory 실행 안내
 
 기존 NeuralGCM의 physics dynamics와 learned physics를 유지하고, 그 예측
-상태에 **공간 통계로 초기화한 memory와 확률적 온도 보정항**을 연결했습니다.
+상태에 **계속 전진하는 spatial latent, 별도 공간 memory와 온도 보정항**을 연결했습니다.
 NeuralGCM 자체에도 확률적 모델이 있으므로, 이번 연구의 가설은 noise 추가
 자체보다 **통계적 과거 정보가 이후의 물리 예측에 유용한가**입니다.
 
@@ -10,21 +10,15 @@ NeuralGCM 자체에도 확률적 모델이 있으므로, 이번 연구의 가설
 
 ## 구조
 
-```mermaid
-flowchart TD
-  O["예측 시작 전 관측장"] --> E["기존 spatial encoder: JAX 변환"]
-  E --> M["여러 시간척도의 memory 초기화"]
-  X["현재 NeuralGCM 상태"] --> B["기존 dynamics + learned physics"]
-  X --> M
-  M --> C["memory 보정 + OU 확률 보정"]
-  B --> Y["다음 대기 상태: 온도 보정 적용"]
-  C --> Y
-  Y --> X
-```
+![Recurrent latent 학습 구조](figures/recurrent_manifold_training.png)
+
+수식과 상태별 역할은 [recurrent latent 설명](RECURRENT_LATENT_KO.md)에 정리했습니다.
 
 - 원래 적분기를 전부 Euler–Maruyama로 바꾸지 않습니다. 기존 semi-implicit
   dynamics solver 뒤에 보정항을 결합하는 operator splitting입니다.
 - memory는 단순한 현재 latent가 아니라, 상태로 유지되는 지수 기억항입니다.
+- `z_0 → z_1 → ...`도 매 내부 스텝 이어집니다. 현재 latent·온도·공간 memory에
+  조건부인 Gaussian 전이에서 다음 latent를 생성하고 다음 단계에 전달합니다.
 - 확률 부분은 보조 OU 상태의 SDE이며, 그 시간적분을 온도에 가합니다.
   시간 간격마다 독립 noise를 무작정 더하는 구조가 아닙니다.
 - 첫 보정 대상은 `temperature_variation`입니다. 압력·수분·바람에 직접적인
@@ -37,13 +31,17 @@ flowchart TD
 정보, 정규화, 변수 순서, pooling, fusion을 checkpoint 계약으로 보존합니다.
 
 NeuralGCM sigma 층의 온도·바람을 `t2m,u10,v10`이라고 취급하지 않습니다.
-대신 기존 encoder로 **시작 시점 이전 관측장**을 encode하여 memory를
-초기화합니다. 예측 중에는 현재 NeuralGCM 온도 상태가 memory를 갱신합니다.
+대신 기존 encoder로 시작 전 관측을 encode하여 공간 memory를 채우고,
+**시작 시각의 관측 latent를 정확히 찾아 `z_0`로 사용**합니다. 예측 중에는
+전이 모델이 다음 latent를 생성하며, 미래 surface 관측을 입력하지 않습니다.
+새 latent가 다음 전이·memory·온도 보정에 계속 영향을 줍니다.
 
-따라서 현재 버전은 **초기 조건에 과거 공간 통계를 반영하는 모델**입니다.
-예측 내내 기존 surface encoder를 재호출하는 모델은 아닙니다. 원래 공간
-통계의 직접적인 영향은 설정한 시간척도에 따라 감소합니다. 기본 최장
-시간척도는 120시간이고, 더 긴 기억은 별도 비교 실험으로 검증해야 합니다.
+공간 memory와 closure memory는 별도입니다. source 초기화가 thermal warmup을
+덮어쓰지 않습니다. 공간 memory 기본 시간척도는 24,120,720시간이고 closure는
+6,24,120시간입니다. 유한한 이력으로 긴 memory를 초기화하는 데 따른 cold-start
+오차가 남으며, 더 긴 시간척도가 장기 성능을 자동 개선하는 것은 아닙니다.
+source latent를 예측하는 것이므로 Gaussian sample이 실제 기하학적 manifold
+위에 놓인다는 보장도 없습니다. 이는 강화학습이 아닌 지도 확률 상태공간 모델입니다.
 
 기존 저장소에서 학습된 `.pt` 가중치는 찾지 못했습니다. 아래 연결 단계에는
 사용자가 실제로 학습한 spatial checkpoint와 `.manifest.json`이 필요합니다.
@@ -63,6 +61,7 @@ source .venv/bin/activate
 python -m pip install -e '.[test,export,netcdf]'
 python -m pytest -q
 python scripts/smoke_neuralgcm.py
+python scripts/smoke_neuralgcm.py --recurrent-latent
 ```
 
 마지막 명령은 공식 패키지의 작은 **toy checkpoint**를 사용합니다. 실제
@@ -125,9 +124,12 @@ NeuralGCM 입력 z는 m²/s² 단위 geopotential입니다. 자동으로 같은 
 간주하지 않습니다. source encoder와 정규화는 반드시 training 기간 자료로
 학습한 것을 사용합니다.
 
-history 파일에 미래 자료가 포함되어 있어도 각 예측은 자신의 시작 시점보다
-엄격히 이전인 자료만 선택합니다. `--through YYYY-MM-DD`로 파일 준비
-자체의 종료 시점도 제한할 수 있습니다.
+recurrent 모드에서는 시작 전 이력으로 memory를 채우고 시작 시각의 latent로
+`z_0`를 초기화합니다. **시작 시각 및 학습 정답 시각과 정확히 일치하는 source
+표본**이 필요하며 nearest time으로 대체하지 않습니다. 학습·validation에서만
+미래 latent를 정답으로 읽고, 자유 예측의 다음 입력으로 주입하지 않습니다.
+평가에는 각 시작 시각까지의 source 이력만 필요합니다. `--through YYYY-MM-DD`로
+파일 종료 시각을 제한할 수 있지만 학습용 파일은 필요한 미래 정답도 포함해야 합니다.
 
 위 `24`는 일별 자료 예시입니다. 실제 관측 주기에 맞춰 **허용할 최대 공백**을
 지정합니다. 각 선택된 과거 표본 사이뿐 아니라 마지막 표본부터 예측 시작까지의
@@ -148,6 +150,8 @@ python scripts/train.py \
   --base-checkpoint checkpoints/base.pkl --trust-base-checkpoint \
   --data data/train_validation_prepared.nc \
   --spatial-history data/spatial_history.npz --spatial-history-steps 8 \
+  --spatial-mode recurrent --latent-loss-weight 0.1 \
+  --latent-tau-hours 24 --latent-memory-tau-hours 24,120,720 \
   --output runs/full/closure.npz \
   --warmup-steps 2 --horizon-steps 4 --ensemble-size 4 \
   --epochs 5 --train-fraction 0.8 --seed 0 \
@@ -160,22 +164,34 @@ python scripts/train.py \
 처음에는 `--max-train-windows 1 --max-validation-windows 1 --epochs 1`로
 연결과 메모리 사용량부터 점검할 수 있습니다.
 
-학습 대상은 추가 closure 파라미터입니다. NeuralGCM 파라미터와 원본 spatial
-encoder는 고정됩니다. 정답 미래장은 loss에만 사용하며 모델 입력으로
-재주입하지 않습니다. 최적 checkpoint는 validation loss로 선택합니다.
+학습 대상은 closure와 latent 전이 파라미터입니다. NeuralGCM 파라미터와 원본
+spatial encoder는 고정됩니다. 총 목적함수는 대기장 예측 점수에 `latent-loss-weight`
+배의 latent 예측 점수를 더한 값입니다. 두 점수 모두 fair CRPS와 predictive-mean
+MSE 보정을 사용합니다. 정답 미래장·latent는 loss에만 사용합니다. 최적 checkpoint는
+동일한 validation 총점으로 선택하고 각 loss 성분도 기록합니다.
+
+위 이력 8간격·예측 4간격은 연결 확인을 위한 작은 설정입니다. 일별 8일 이력은
+30일 시간척도의 memory를 충분히 채우지 못하므로 실제 장기 실험에는 과거 길이와
+학습 horizon을 함께 늘리고 메모리 비용을 확인해야 합니다. 기본값은 최적 설정을
+뜻하지 않습니다.
 
 | 비교 | 별도 학습에서 사용할 옵션 |
 |---|---|
 | 원래 NeuralGCM | 평가 때 `--baseline` |
-| memory 없이 보정·확률항 | `--no-memory` |
-| 확률항 없이 결정론적 memory | `--no-stochastic` |
+| 두 지수 memory 없이 recurrent latent 유지 | `--no-memory` |
+| 새 OU·latent 확률항 없이 결정론적 보정 | `--no-stochastic` |
 | 현재 상태의 직접 보정 없이 memory·확률항 | `--no-spatial` |
 | 기존 spatial history 없이 native memory | `--spatial-history` 생략 |
+| 이전의 초기화 전용 spatial memory | `--spatial-mode initialization` |
+| latent 정답 감독 없이 대기장 loss만 사용 | `--latent-loss-weight 0` |
 | 전체 구조 | 위 명령 |
 
 `--no-spatial`은 **현재 상태의 순간 readout**을 끕니다. source spatial
 history를 끄는 옵션이라는 뜻은 아닙니다. 각 구조는 별도로 학습해야 하며,
 source 유무 비교에서는 파라미터 수와 초기화 차이도 함께 보고해야 합니다.
+`--no-stochastic`도 원본 stochastic NeuralGCM의 난수까지 끄지는 않습니다.
+기존 checkpoint는 재학습 없이 recurrent 모델로 바뀌지 않으며, 저장한 config에
+따라 이전 초기화 전용 경로로 평가됩니다.
 
 ## 5. 독립 평가와 원래 모델 비교
 

@@ -1,9 +1,10 @@
 """Causal transfer of observed Climate Manifold statistics into forecast memory.
 
-Source surface fields are used only before the forecast origin. During the
-forecast the native sigma-temperature channels drive the memory; the source
-latent channels are zero. Thus no unavailable surface diagnostic is invented,
-and the statistical information persists through the recurrent memory state.
+Legacy mode uses strictly past source fields to seed thermal memory; forecast
+source channels then remain zero. Recurrent latent mode uses past fields to
+seed separate spatial memory and an observed latent AT the origin to seed z.
+Subsequent z states evolve autonomously with thermal feedback and innovations.
+Future source fields are labels only; they are never reset into forecast state.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ngcm_memory.closure import closure_step, initialize_memory
+from ngcm_memory.latent import initialize_latent
 
 
 def history_gap_contract(times, metadata):
@@ -183,6 +185,69 @@ class SpatialHistory:
         features = regrid_lonlat(self.latents[indices], self.source_lon, self.source_lat,
                                 self.target_lon, self.target_lat)
         return {"features": features, "dt_hours": jnp.asarray(durations, dtype=jnp.float32)}
+
+    def _exact_indices(self, times):
+        """Require every requested observation; never nearest/interpolated time."""
+        requested = np.asarray(times).astype("datetime64[ns]")
+        if requested.ndim != 1 or np.isnat(requested).any():
+            raise ValueError("Source latent lookup needs a one-dimensional finite time array")
+        indices = np.searchsorted(self.times, requested, side="left")
+        safe_indices = np.minimum(indices, len(self.times) - 1)
+        found = (indices < len(self.times)) & (self.times[safe_indices] == requested)
+        if not found.all():
+            raise ValueError(f"No source latent at exact timestamp {requested[np.flatnonzero(~found)[0]]}")
+        return indices
+
+    def targets_at(self, times):
+        """Exact-time observed latent labels [time,D,lon,lat] on model grid.
+
+        This method only retrieves data. Callers must keep future labels in the
+        training/evaluation loss, outside forecast initialization and recurrence.
+        """
+        indices = self._exact_indices(times)
+        return regrid_lonlat(self.latents[indices], self.source_lon, self.source_lat,
+                             self.target_lon, self.target_lat)
+
+    def transition_context(self, origin_time, history_steps=8):
+        """Past memory context plus observed z at origin; never reads future z."""
+        # Lookup first so missing origin observations fail explicitly, including
+        # a request falling between the final sample and its allowed hold end.
+        initial = self.targets_at(np.asarray([np.datetime64(origin_time, "ns")]))[0]
+        return {**self.context(origin_time, history_steps), "initial_latent": initial}
+
+    def transition_initializer(self, config):
+        """Seed separate spatial memory and origin z, preserving thermal warmup.
+
+        Historical source latents are held over their validated following
+        intervals and integrated analytically into each spatial memory scale.
+        No learned transition is teacher-forced through the historical window.
+        Finite cold-start history truncates older contributions; choose a window
+        long enough for the configured spatial-memory timescales.
+        """
+        if config.latent_dim != self.feature_dim or config.latent_dim < 1:
+            raise ValueError("latent_dim must equal the source spatial latent channels")
+        if config.feature_dim != config.levels + self.feature_dim:
+            raise ValueError("Closure channels must equal sigma levels + spatial latent channels")
+        def seed(params, state, context):
+            del params
+            if state.latent_state is None:
+                raise ValueError("Recurrent spatial initialization requires latent_state")
+            source = context["features"]
+            initial = context["initial_latent"]
+            expected = (config.latent_dim, *source.shape[-2:])
+            if source.ndim != 4 or source.shape[1:] != expected or initial.shape != expected:
+                raise ValueError("Spatial initialization latent shapes do not match config")
+            memory = initialize_latent(source.shape[-2:], config, state.latent_state.key).memory
+            if config.enable_memory:
+                taus = jnp.asarray(config.latent_memory_tau_hours, source.dtype)[:, None, None, None]
+                def step(previous, item):
+                    latent, dt = item
+                    weight = -jnp.expm1(-dt / taus)
+                    return previous + weight * (latent[None] - previous), None
+                memory, _ = jax.lax.scan(step, memory, (source, context["dt_hours"]))
+            latent_state = state.latent_state._replace(latent=initial, memory=memory)
+            return state._replace(latent_state=latent_state)
+        return seed
 
     def initializer(self, config):
         """Return ``(params, augmented_state, context) -> augmented_state``.

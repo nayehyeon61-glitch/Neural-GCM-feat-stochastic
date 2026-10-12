@@ -29,6 +29,7 @@ from ngcm_memory.closure import (
     closure_step,
     initialize_memory,
 )
+from ngcm_memory.latent import LatentState, initialize_latent, latent_step
 
 
 class AugmentedState(NamedTuple):
@@ -36,6 +37,7 @@ class AugmentedState(NamedTuple):
 
     model_state: Any
     closure_state: ClosureState
+    latent_state: LatentState | None = None
 
 
 def _prognostics(state: Any) -> Any:
@@ -105,7 +107,9 @@ class NeuralGCMMemoryAdapter:
                 f"Closure levels={config.levels} does not match NeuralGCM "
                 f"sigma levels={coords.vertical.layers}"
             )
-        if feature_fn is None and config.feature_dim != config.levels:
+        if config.latent_dim and feature_fn is not None:
+            raise ValueError("Latent mode owns thermal + recurrent latent features; feature_fn must be None")
+        if feature_fn is None and not config.latent_dim and config.feature_dim != config.levels:
             raise ValueError(
                 "Default thermal features require feature_dim == levels; "
                 "provide feature_fn for spatial/statistical conditioning"
@@ -124,12 +128,17 @@ class NeuralGCMMemoryAdapter:
         nodal = self.base_model.model_coords.horizontal.to_nodal(field)
         return self.base_model.from_nondim_units(nodal, "K")
 
-    def features(self, model_state: Any, forcings: Any) -> jax.Array:
+    def features(self, model_state: Any, forcings: Any,
+                 latent_state: LatentState | None = None) -> jax.Array:
         if self.feature_fn is None:
             values = (
                 self.temperature_variation_kelvin(model_state)
                 / self.feature_scale_kelvin
             )
+            if self.config.latent_dim:
+                if latent_state is None:
+                    raise ValueError("Latent mode requires carried latent_state")
+                values = jnp.concatenate([values, latent_state.latent], axis=0)
         else:
             values = self.feature_fn(model_state, forcings)
         values = jnp.asarray(values)
@@ -152,6 +161,8 @@ class NeuralGCMMemoryAdapter:
         return AugmentedState(
             model_state,
             initialize_memory(self.grid_shape, self.config, key),
+            initialize_latent(self.grid_shape, self.config, jax.random.fold_in(key, 7320))
+            if self.config.latent_dim else None,
         )
 
     def encode(
@@ -166,12 +177,34 @@ class NeuralGCMMemoryAdapter:
         self, params: Any, state: AugmentedState, forcings: Any
     ) -> AugmentedState:
         """Advance one internal model timestep with the thermal closure."""
+        return self._advance(params, state, forcings, evolve_latent=True)
+
+    def advance_warmup(
+        self, params: Any, state: AugmentedState, forcings: Any
+    ) -> AugmentedState:
+        """Warm thermal memory on observations without inventing historical z.
+
+        Recurrent mode uses zero source channels during native thermal warmup
+        and preserves the entire latent state. Observed source history then
+        initializes separate spatial memory and z once at the forecast origin.
+        Legacy mode follows its ordinary advance behavior.
+        """
+        return self._advance(params, state, forcings, evolve_latent=False)
+
+    def _advance(self, params, state, forcings, *, evolve_latent):
         next_model_state = self.base_model.advance(state.model_state, forcings)
         if not self.enabled:
             # No spectral round-trip and no RNG or memory consumption.
-            return AugmentedState(next_model_state, state.closure_state)
+            return AugmentedState(next_model_state, state.closure_state, state.latent_state)
 
-        features = self.features(state.model_state, forcings)
+        feature_latent_state = state.latent_state
+        if self.config.latent_dim and not evolve_latent:
+            if feature_latent_state is None:
+                raise ValueError("Latent mode requires carried latent_state")
+            feature_latent_state = feature_latent_state._replace(
+                latent=jnp.zeros_like(feature_latent_state.latent)
+            )
+        features = self.features(state.model_state, forcings, feature_latent_state)
         increment_kelvin, next_closure_state = closure_step(
             params, state.closure_state, features, self.dt_hours, self.config
         )
@@ -190,7 +223,15 @@ class NeuralGCMMemoryAdapter:
         corrected_state = _replace_temperature(
             next_model_state, original_temperature + increment_modal
         )
-        return AugmentedState(corrected_state, next_closure_state)
+        next_latent_state = state.latent_state
+        if self.config.latent_dim and evolve_latent:
+            # Both closures see the current accepted state. The new z becomes
+            # input on the NEXT step; no future observed latent enters rollout.
+            next_latent_state = latent_step(
+                params["latent_transition"], state.latent_state,
+                features[:self.config.levels], self.dt_hours, self.config,
+            )
+        return AugmentedState(corrected_state, next_closure_state, next_latent_state)
 
     def decode(self, state: AugmentedState, forcings: Any) -> Any:
         """Decode corrected prognostics using the unchanged pretrained decoder."""

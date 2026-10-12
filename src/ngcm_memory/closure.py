@@ -53,6 +53,13 @@ class ClosureConfig:
     enable_memory: bool = True
     enable_stochastic: bool = True
     enable_spatial: bool = True
+    # Zero keeps the original checkpoint/feature contract exactly unchanged.
+    latent_dim: int = 0
+    latent_hidden_dim: int = 16
+    latent_tau_hours: float = 24.0
+    latent_memory_tau_hours: tuple[float, ...] = (24.0, 120.0, 720.0)
+    latent_max_diffusion_per_sqrt_hour: float = 0.1
+    latent_target_bound: float = 5.0
 
     def __post_init__(self) -> None:
         for name in ("feature_dim", "levels", "hidden_dim"):
@@ -69,6 +76,21 @@ class ClosureConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
+        if isinstance(self.latent_dim, bool) or not isinstance(self.latent_dim, (int, np.integer)) or self.latent_dim < 0:
+            raise ValueError("latent_dim must be a nonnegative integer")
+        if isinstance(self.latent_hidden_dim, bool) or not isinstance(self.latent_hidden_dim, (int, np.integer)) or self.latent_hidden_dim <= 0:
+            raise ValueError("latent_hidden_dim must be a positive integer")
+        if self.latent_dim and self.feature_dim != self.levels + self.latent_dim:
+            raise ValueError("Latent mode requires feature_dim == levels + latent_dim")
+        object.__setattr__(self, "latent_memory_tau_hours", tuple(float(t) for t in self.latent_memory_tau_hours))
+        if not self.latent_memory_tau_hours or any(not math.isfinite(t) or t <= 0 for t in self.latent_memory_tau_hours):
+            raise ValueError("latent_memory_tau_hours must contain finite positive timescales")
+        for name in ("latent_tau_hours", "latent_target_bound"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not math.isfinite(self.latent_max_diffusion_per_sqrt_hour) or self.latent_max_diffusion_per_sqrt_hour < 0:
+            raise ValueError("latent_max_diffusion_per_sqrt_hour must be finite and nonnegative")
 
 
 class ClosureState(NamedTuple):
@@ -92,7 +114,7 @@ def init_params(key: jax.Array, config: ClosureConfig) -> dict[str, jax.Array]:
     """
 
     encoder_key, spatial_key, memory_key, diffusion_key = jax.random.split(key, 4)
-    return {
+    params = {
         "encoder_w": jax.random.normal(encoder_key, (config.hidden_dim, config.feature_dim))
         / math.sqrt(config.feature_dim),
         "encoder_b": jnp.zeros((config.hidden_dim,)),
@@ -103,6 +125,12 @@ def init_params(key: jax.Array, config: ClosureConfig) -> dict[str, jax.Array]:
         * jax.random.normal(diffusion_key, (config.levels, config.hidden_dim)),
         "diffusion_b": jnp.full((config.levels,), -2.0),
     }
+    if config.latent_dim:
+        # Fold rather than resplit so all original closure heads retain their
+        # exact initial values. Latent parameters have an independent stream.
+        from ngcm_memory.latent import init_latent_params
+        params["latent_transition"] = init_latent_params(jax.random.fold_in(key, 7319), config)
+    return params
 
 
 def initialize_memory(

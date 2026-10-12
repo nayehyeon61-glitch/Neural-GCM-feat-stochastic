@@ -172,3 +172,49 @@ def test_past_spatial_features_change_differentiable_corrected_forecast(tmp_path
     no_memory_config = replace(config, enable_memory=False)
     ablated = history.initializer(no_memory_config)(params, state, context)
     np.testing.assert_array_equal(ablated.closure_state.memory, 0.)
+
+
+def test_recurrent_context_uses_origin_but_never_future_and_requires_exact_times(tmp_path):
+    history = _history(tmp_path)
+    origin = history.times[3]
+    context = history.transition_context(origin, 2)
+    np.testing.assert_array_equal(context["features"][:, 0, 0, 0], [1., 2.])
+    np.testing.assert_array_equal(context["initial_latent"], 3.)
+    changed = history.latents.copy()
+    changed[4:] += 1e6
+    other = _history(tmp_path, "changed_after_origin", changed)
+    for name, value in other.transition_context(origin, 2).items():
+        np.testing.assert_array_equal(value, context[name])
+    np.testing.assert_array_equal(history.targets_at(history.times[[4, 5]])[:, 0, 0, 0], [4., 5.])
+    with pytest.raises(ValueError, match="exact timestamp"):
+        history.transition_context("2001-01-01T03:30", 2)
+    with pytest.raises(ValueError, match="exact timestamp"):
+        history.targets_at(np.asarray(["2001-01-01T06"], dtype="datetime64[ns]"))
+
+
+def test_spatial_initialization_preserves_thermal_memory_and_seeds_all_past_latents(tmp_path):
+    history = _history(tmp_path)
+    config = ClosureConfig(feature_dim=3, levels=2, hidden_dim=2, latent_dim=1,
+                           latent_memory_tau_hours=(1., 2.), enable_stochastic=False)
+    adapter = NeuralGCMMemoryAdapter(_base(), config)
+    model_state = ModelState(
+        Prognostics(jnp.ones((2, 4, 3)), jnp.asarray(0.), jnp.ones((2, 4, 3))),
+        {"existing_memory": jnp.asarray(9.)}, jnp.asarray(7.), {"diagnostic": jnp.asarray(2.)})
+    state = adapter.initialize(model_state, jax.random.key(2))
+    state = state._replace(closure_state=state.closure_state._replace(
+        memory=jnp.ones_like(state.closure_state.memory), ou=jnp.ones_like(state.closure_state.ou)))
+    context = history.transition_context(history.times[3], 2)
+    warm = jax.jit(history.transition_initializer(config))({}, state, context)
+    for actual, expected in zip(jax.tree.leaves(warm.closure_state), jax.tree.leaves(state.closure_state)):
+        # Typed PRNG keys require key_data rather than numpy conversion.
+        if jax.dtypes.issubdtype(actual.dtype, jax.dtypes.prng_key):
+            actual, expected = jax.random.key_data(actual), jax.random.key_data(expected)
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(warm.latent_state.latent, 3.)
+    a = np.exp(-1. / np.array([1., 2.]))
+    expected_memory = a * (1 - a) * 1. + (1 - a) * 2.
+    np.testing.assert_allclose(warm.latent_state.memory[:, 0, 0, 0], expected_memory, rtol=1e-6)
+    np.testing.assert_array_equal(jax.random.key_data(warm.latent_state.key), jax.random.key_data(state.latent_state.key))
+    ablated = history.transition_initializer(replace(config, enable_memory=False))({}, state, context)
+    np.testing.assert_array_equal(ablated.latent_state.memory, 0.)
+    np.testing.assert_array_equal(ablated.closure_state.memory, state.closure_state.memory)

@@ -22,7 +22,7 @@ from ngcm_memory.closure import ClosureConfig, init_params
 from ngcm_memory.features import SpatialHistory, thermal_with_empty_spatial
 from ngcm_memory.neuralgcm_adapter import NeuralGCMMemoryAdapter
 from ngcm_memory.training import (
-    forecast_loss, load_local_problem, make_train_step, rollout_ensemble,
+    filter_spatial_origins, joint_forecast_loss, load_local_problem, make_train_step, rollout_ensemble,
     save_closure_checkpoint, sha256_file, slice_window, temporal_window_split,
     validate_time_axis,
 )
@@ -61,6 +61,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-spatial", action="store_true", help="Train without the instantaneous term; source history remains optional")
     p.add_argument("--spatial-history", type=Path, help="Causal observed history from the exported Climate Manifold encoder")
     p.add_argument("--spatial-history-steps", type=int, default=8)
+    p.add_argument("--spatial-mode", choices=("recurrent", "initialization"), default="recurrent",
+                   help="With source history: recurrent latent dynamics (default), or legacy initialization only")
+    p.add_argument("--latent-loss-weight", type=float, default=None,
+                   help="Default .1 in recurrent mode, 0 otherwise; explicit 0 disables latent supervision as an ablation")
+    p.add_argument("--latent-hidden-dim", type=int, default=16)
+    p.add_argument("--latent-tau-hours", type=float, default=24.)
+    p.add_argument("--latent-memory-tau-hours", default="24,120,720")
+    p.add_argument("--latent-max-diffusion-per-sqrt-hour", type=float, default=.1)
+    p.add_argument("--latent-target-bound", type=float, default=5.)
     return p
 
 
@@ -84,6 +93,15 @@ def main(argv: list[str] | None = None) -> None:
     if len(scale_values) != len(variables) or any(not np.isfinite(value) or value <= 0 for value in scale_values):
         p.error("--scales requires one finite positive scale per --variables entry")
     scales = dict(zip(variables, scale_values))
+    recurrent = bool(args.spatial_history) and args.spatial_mode == "recurrent"
+    latent_loss_weight = args.latent_loss_weight if args.latent_loss_weight is not None else (.1 if recurrent else 0.)
+    if not np.isfinite(latent_loss_weight) or latent_loss_weight < 0:
+        p.error("latent-loss-weight must be finite and nonnegative")
+    if latent_loss_weight > 0 and not recurrent:
+        p.error("Positive latent-loss-weight requires --spatial-history and --spatial-mode recurrent")
+    if recurrent and latent_loss_weight == 0:
+        print("Latent supervision is explicitly disabled: recurrent latents are trained only through physical forecast loss.",
+              file=sys.stderr, flush=True)
     base, dataset, inputs, forcings = load_local_problem(
         args.base_checkpoint, args.data, trust_checkpoint=args.trust_base_checkpoint,
     )
@@ -106,20 +124,28 @@ def main(argv: list[str] | None = None) -> None:
         max_diffusion_k_sqrt_hour=args.max_diffusion_k_sqrt_hour,
         enable_memory=not args.no_memory, enable_stochastic=not args.no_stochastic,
         enable_spatial=not args.no_spatial,
+        latent_dim=spatial_dim if recurrent else 0,
+        latent_hidden_dim=args.latent_hidden_dim,
+        latent_tau_hours=args.latent_tau_hours,
+        latent_memory_tau_hours=tuple(map(float, args.latent_memory_tau_hours.split(","))),
+        latent_max_diffusion_per_sqrt_hour=args.latent_max_diffusion_per_sqrt_hour,
+        latent_target_bound=args.latent_target_bound,
     )
-    feature_fn = thermal_with_empty_spatial(base, spatial_dim, args.feature_scale_kelvin) if history else None
+    feature_fn = thermal_with_empty_spatial(base, spatial_dim, args.feature_scale_kelvin) if history and not recurrent else None
     adapter = NeuralGCMMemoryAdapter(
         base, config, feature_fn, feature_scale_kelvin=args.feature_scale_kelvin,
         remove_global_mean=args.remove_global_mean,
     )
-    initializer = history.initializer(config) if history else None
+    initializer = (history.transition_initializer(config) if recurrent else history.initializer(config)) if history else None
     if history:
         if args.spatial_history_steps < 1:
             p.error("spatial-history-steps must be positive")
-        train_origins, train_history_filter = history.filter_origins(
-            dataset.time.values, train_origins, args.spatial_history_steps)
-        val_origins, validation_history_filter = history.filter_origins(
-            dataset.time.values, val_origins, args.spatial_history_steps)
+        filter_kwargs = dict(recurrent=recurrent, horizon_steps=args.horizon_steps,
+                             require_future_targets=latent_loss_weight > 0)
+        train_origins, train_history_filter = filter_spatial_origins(
+            history, dataset.time.values, train_origins, args.spatial_history_steps, **filter_kwargs)
+        val_origins, validation_history_filter = filter_spatial_origins(
+            history, dataset.time.values, val_origins, args.spatial_history_steps, **filter_kwargs)
         for partition, details in (("training", train_history_filter), ("validation", validation_history_filter)):
             if details["rejected_windows"]:
                 print(json.dumps({"spatial_history_filter": partition, **details}), file=sys.stderr, flush=True)
@@ -133,8 +159,15 @@ def main(argv: list[str] | None = None) -> None:
     # Only one regridded context is live at a time. Caching all overlapping
     # windows would duplicate large source grids onto the accelerator.
     def context_for(origin):
-        return history.context(dataset.time.values[origin], args.spatial_history_steps) if history else None
+        if history is None:
+            return None
+        context = (history.transition_context if recurrent else history.context)(
+            dataset.time.values[origin], args.spatial_history_steps)
+        if latent_loss_weight > 0:
+            context["latent_targets"] = history.targets_at(dataset.time.values[origin + 1:origin + args.horizon_steps + 1])
+        return context
     area_weights = base.data_coords.horizontal.quadrature_weights
+    latent_area_weights = base.model_coords.horizontal.quadrature_weights if recurrent else None
     params = init_params(jax.random.PRNGKey(args.seed), config)
     optimizer = optax.chain(optax.clip_by_global_norm(args.gradient_clip), optax.adam(args.learning_rate))
     opt_state = optimizer.init(params)
@@ -143,21 +176,29 @@ def main(argv: list[str] | None = None) -> None:
         internal_steps=internal_steps, variables=variables, scales=scales,
         area_weights=area_weights, forcing_mode=args.forcing_mode,
         mean_mse_weight=args.mean_mse_weight, memory_initializer=initializer,
+        latent_loss_weight=latent_loss_weight, latent_area_weights=latent_area_weights,
     )
 
     @jax.jit
     def validation_loss(parameters, x, forcing, keys, context):
-        prediction = rollout_ensemble(
+        output = rollout_ensemble(
             parameters, adapter, x, forcing, keys, warmup_steps=args.warmup_steps,
             horizon_steps=args.horizon_steps, internal_steps=internal_steps,
             variables=variables, forcing_mode=args.forcing_mode,
             memory_initializer=initializer, memory_context=context,
+            return_latents=latent_loss_weight > 0,
         )
+        prediction, latent_prediction = output if latent_loss_weight > 0 else (output, None)
         targets = {name: x[name][args.warmup_steps + 1:] for name in variables}
-        return forecast_loss(prediction, targets, area_weights, scales, args.mean_mse_weight)
+        return joint_forecast_loss(
+            prediction, targets, area_weights, scales, args.mean_mse_weight,
+            latent_predictions=latent_prediction,
+            latent_targets=context["latent_targets"] if latent_loss_weight > 0 else None,
+            latent_loss_weight=latent_loss_weight, latent_area_weights=latent_area_weights,
+        )
 
     metadata = {
-        "implementation": "ngcm_memory.frozen_base_rollout.v1",
+        "implementation": "ngcm_memory.recurrent_latent_rollout.v2" if recurrent else "ngcm_memory.frozen_base_rollout.v1",
         "base_checkpoint_sha256": sha256_file(args.base_checkpoint),
         "training_data_sha256": sha256_file(args.data),
         "training_last_observation": str(dataset.time.values[cut - 1]),
@@ -175,6 +216,12 @@ def main(argv: list[str] | None = None) -> None:
         "spatial_history_steps": args.spatial_history_steps if history else None,
         "spatial_history": history.metadata if history else None,
         "spatial_history_artifact_sha256": history.artifact_sha256 if history else None,
+        "spatial_mode": args.spatial_mode if history else "none",
+        "latent_initialization": "observed_exact_origin_and_past_memory" if recurrent else None,
+        "latent_loss_weight": latent_loss_weight,
+        "latent_supervision": "normalized_frozen_source_at_observation_leads" if latent_loss_weight > 0 else "none",
+        "latent_memory_tau_hours": list(config.latent_memory_tau_hours) if recurrent else None,
+        "latent_tau_hours": config.latent_tau_hours if recurrent else None,
         "train_window_count": len(train_origins), "validation_window_count": len(val_origins),
         "base_parameters_frozen": True,
     }
@@ -184,7 +231,8 @@ def main(argv: list[str] | None = None) -> None:
     step_number = 0
     print(json.dumps({"train_windows": len(train_origins), "validation_windows": len(val_origins),
                       "forecast_hours": hours * args.horizon_steps,
-                      "forcing_mode": args.forcing_mode}), flush=True)
+                      "forcing_mode": args.forcing_mode, "spatial_mode": metadata["spatial_mode"],
+                      "latent_loss_weight": latent_loss_weight}), flush=True)
     for epoch in range(args.epochs):
         epoch_losses, gradient_norms = [], []
         for origin in order_rng.permutation(train_origins):
@@ -199,19 +247,23 @@ def main(argv: list[str] | None = None) -> None:
             epoch_losses.append(loss)
             gradient_norms.append(norm)
             step_number += 1
-        validation = []
+        validation, validation_physical, validation_latent = [], [], []
         for origin in val_origins:
             # Identical validation random seeds across epochs for comparability.
             key = jax.random.fold_in(jax.random.PRNGKey(args.seed + 2), int(origin))
-            loss = validation_loss(
+            loss, physical_loss, latent_loss = validation_loss(
                 params, slice_window(inputs, int(origin), args.warmup_steps, args.horizon_steps),
                 slice_window(forcings, int(origin), args.warmup_steps, args.horizon_steps),
                 jax.random.split(key, args.ensemble_size), context_for(int(origin)),
             )
             validation.append(float(loss))
+            validation_physical.append(float(physical_loss))
+            validation_latent.append(float(latent_loss))
         record = {"epoch": epoch + 1, "updates": step_number,
                   "train_loss": float(np.mean(epoch_losses)),
                   "validation_loss": float(np.mean(validation)),
+                  "validation_physical_loss": float(np.mean(validation_physical)),
+                  "validation_latent_loss": float(np.mean(validation_latent)),
                   "mean_gradient_norm": float(np.mean(gradient_norms))}
         if not np.isfinite(record["validation_loss"]):
             raise FloatingPointError("Nonfinite validation forecast")

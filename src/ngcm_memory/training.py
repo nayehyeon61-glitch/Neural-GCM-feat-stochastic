@@ -73,6 +73,42 @@ def evaluation_origins(
     return origins
 
 
+def filter_spatial_origins(
+    history: Any, times: Any, origins: Any, history_steps: int, *,
+    recurrent: bool = False, horizon_steps: int = 0, require_future_targets: bool = False,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Validate source coverage without regridding every candidate window.
+
+    Recurrent forecasts need an observed latent exactly at the origin. Future
+    latents are needed only for supervised training/validation, never for a
+    forecast or evaluation. Reject rather than interpolate absent labels.
+    """
+    if require_future_targets and (not recurrent or horizon_steps < 1):
+        raise ValueError("Future latent labels require recurrent mode and a positive horizon")
+    accepted, rejected, first_error = [], 0, None
+    times = np.asarray(times).astype("datetime64[ns]")
+    source_times = np.asarray(history.times).astype("datetime64[ns]")
+    for origin in origins:
+        try:
+            history.validate_context(times[origin], history_steps)
+            if recurrent:
+                count = horizon_steps + 1 if require_future_targets else 1
+                required = times[origin:origin + count]
+                if len(required) != count:
+                    raise ValueError("Source target window extends beyond available observations")
+                indices = np.searchsorted(source_times, required)
+                if np.any(indices >= len(source_times)) or not np.array_equal(source_times[indices], required):
+                    purpose = "origin and future labels" if require_future_targets else "forecast origin"
+                    raise ValueError(f"Need exact spatial latents at {purpose} timestamps for origin {times[origin]}")
+        except ValueError as error:
+            rejected += 1
+            if first_error is None:
+                first_error = str(error)
+        else:
+            accepted.append(origin)
+    return np.asarray(accepted, dtype=int), {"rejected_windows": rejected, "first_error": first_error}
+
+
 def independent_test_start_index(times: Any, metadata: dict[str, Any], start_time: str | None = None) -> int:
     """Keep reported test targets and their warmup after model selection data."""
     if "validation_last_observation" not in metadata:
@@ -104,10 +140,12 @@ def _timed_forcings(forcings: dict[str, Any], sim_time: Any) -> dict[str, Any]:
 def _advance_interval(
     adapter: Any, params: Any, state: Any, forcings: Any,
     sim_start: Any, sim_delta: Any, internal_steps: int,
+    *, warmup: bool = False,
 ) -> Any:
+    advance_state = getattr(adapter, "advance_warmup", adapter.advance) if warmup else adapter.advance
     def advance(carry: Any, step: Any) -> tuple[Any, None]:
         timed = _timed_forcings(forcings, sim_start + sim_delta * step / internal_steps)
-        return adapter.advance(params, carry, timed), None
+        return advance_state(params, carry, timed), None
     return jax.lax.scan(advance, state, jnp.arange(internal_steps))[0]
 
 
@@ -117,7 +155,8 @@ def rollout_ensemble(
     variables: tuple[str, ...] = ("temperature",), forcing_mode: str = "persistence",
     memory_initializer: Callable[[Any, Any, Any], Any] | None = None,
     memory_context: Any = None,
-) -> dict[str, Any]:
+    return_latents: bool = False,
+) -> Any:
     """Roll out [member,lead,...] fields with causal observed-history warmup.
 
     inputs/forcings include warmup + origin + horizon observations. Only input
@@ -127,6 +166,9 @@ def rollout_ensemble(
 
     memory_initializer optionally replaces/seeds the warmed memory from a
     caller-prepared, causal context. It must be a JAX-transformable function.
+    When return_latents=True, return (fields, latent_trajectories), with latent
+    trajectories sampled only at observation leads. Labels are stripped before
+    passing context to an initializer and never enter the autoregressive state.
     """
     if forcing_mode not in {"persistence", "observed"}:
         raise ValueError("forcing_mode must be persistence or observed")
@@ -136,7 +178,10 @@ def rollout_ensemble(
     if inputs["sim_time"].shape[0] != required:
         raise ValueError("Window length does not match warmup + origin + horizon")
 
-    def member(key: Any) -> dict[str, Any]:
+    causal_context = ({name: value for name, value in memory_context.items() if name != "latent_targets"}
+                      if isinstance(memory_context, dict) else memory_context)
+
+    def member(key: Any) -> Any:
         initial_key, refresh_key = jax.random.split(key)
         state = adapter.encode(_at(inputs, 0), _at(forcings, 0), initial_key)
 
@@ -150,7 +195,7 @@ def rollout_ensemble(
             sim_delta = inputs["sim_time"][index + 1] - sim_start
             carry = _advance_interval(
                 adapter, params, carry, _at(forcings, index),
-                sim_start, sim_delta, internal_steps,
+                sim_start, sim_delta, internal_steps, warmup=True,
             )
             return carry, None
 
@@ -162,7 +207,9 @@ def rollout_ensemble(
             )
             state = state._replace(model_state=observed_origin)
         if memory_initializer is not None:
-            state = memory_initializer(params, state, memory_context)
+            state = memory_initializer(params, state, causal_context)
+        if return_latents and getattr(state, "latent_state", None) is None:
+            raise ValueError("return_latents requires an adapter with a recurrent latent state")
 
         def forecast(carry: Any, lead: Any) -> tuple[Any, dict[str, Any]]:
             index = warmup_steps + lead
@@ -176,7 +223,10 @@ def rollout_ensemble(
             )
             decode_boundary = _at(forcings, index + 1) if forcing_mode == "observed" else boundary
             decoded = adapter.decode(carry, _timed_forcings(decode_boundary, sim_end))
-            return carry, {variable: decoded[variable] for variable in variables}
+            fields = {variable: decoded[variable] for variable in variables}
+            if return_latents:
+                return carry, (fields, carry.latent_state.latent)
+            return carry, fields
 
         return jax.lax.scan(forecast, state, jnp.arange(horizon_steps))[1]
 
@@ -215,17 +265,32 @@ def make_train_step(
     horizon_steps: int, internal_steps: int, variables: tuple[str, ...],
     scales: dict[str, float], area_weights: Any, forcing_mode: str = "persistence",
     mean_mse_weight: float = 0.1, memory_initializer: Callable | None = None,
+    latent_loss_weight: float = 0., latent_area_weights: Any = None,
 ) -> Callable:
     """JIT one window update; gradients are only with respect to params."""
+    if not np.isfinite(latent_loss_weight) or latent_loss_weight < 0:
+        raise ValueError("latent_loss_weight must be finite and nonnegative")
+    supervise_latents = latent_loss_weight > 0
+
     def objective(params: Any, inputs: Any, forcings: Any, keys: Any, context: Any) -> Any:
-        predictions = rollout_ensemble(
+        output = rollout_ensemble(
             params, adapter, inputs, forcings, keys, warmup_steps=warmup_steps,
             horizon_steps=horizon_steps, internal_steps=internal_steps,
             variables=variables, forcing_mode=forcing_mode,
             memory_initializer=memory_initializer, memory_context=context,
+            return_latents=supervise_latents,
         )
+        predictions, latents = output if supervise_latents else (output, None)
         targets = {name: inputs[name][warmup_steps + 1:] for name in variables}
-        return forecast_loss(predictions, targets, area_weights, scales, mean_mse_weight)
+        if supervise_latents and (not isinstance(context, dict) or "latent_targets" not in context):
+            raise ValueError("Positive latent_loss_weight requires context['latent_targets']")
+        total, _, _ = joint_forecast_loss(
+            predictions, targets, area_weights, scales, mean_mse_weight,
+            latent_predictions=latents,
+            latent_targets=context["latent_targets"] if supervise_latents else None,
+            latent_loss_weight=latent_loss_weight, latent_area_weights=latent_area_weights,
+        )
+        return total
 
     @jax.jit
     def step(params: Any, opt_state: Any, inputs: Any, forcings: Any, keys: Any, context: Any = None) -> Any:
@@ -235,6 +300,34 @@ def make_train_step(
         next_params = optax.apply_updates(params, updates)
         return next_params, next_opt_state, loss, grad_norm
     return step
+
+
+def joint_forecast_loss(
+    predictions: dict[str, Any], targets: dict[str, Any], area_weights: Any,
+    scales: dict[str, float], mean_mse_weight: float = .1, *,
+    latent_predictions: Any = None, latent_targets: Any = None,
+    latent_loss_weight: float = 0., latent_area_weights: Any = None,
+) -> tuple[Any, Any, Any]:
+    """Return total, physical, latent fair-score objectives.
+
+    The source encoder's frozen normalized latents are supervised at actual
+    observation leads, not interpolated hourly pseudo-targets. Latent and
+    decoded physical grids may differ, so each has its own area quadrature.
+    """
+    if not np.isfinite(latent_loss_weight) or latent_loss_weight < 0:
+        raise ValueError("latent_loss_weight must be finite and nonnegative")
+    physical = forecast_loss(predictions, targets, area_weights, scales, mean_mse_weight)
+    latent = jnp.zeros_like(physical)
+    if latent_loss_weight:
+        if latent_predictions is None or latent_targets is None or latent_area_weights is None:
+            raise ValueError("Latent supervision requires predictions, targets and latent area weights")
+        if latent_predictions.shape[1:] != latent_targets.shape:
+            raise ValueError("Latent labels must match forecast lead, channel and grid dimensions exactly")
+        latent = forecast_loss(
+            {"latent": latent_predictions}, {"latent": latent_targets},
+            latent_area_weights, {"latent": 1.}, mean_mse_weight,
+        )
+    return physical + latent_loss_weight * latent, physical, latent
 
 
 def sha256_file(path: str | Path) -> str:
@@ -273,8 +366,9 @@ def load_closure_checkpoint(path: str | Path) -> tuple[Any, Any, dict[str, Any]]
         if checkpoint["format_version"].item() != 1:
             raise ValueError("Unsupported closure checkpoint format")
         config_dict = json.loads(checkpoint["config"].item())
-        if "tau_hours" in config_dict:
-            config_dict["tau_hours"] = tuple(config_dict["tau_hours"])
+        for name in ("tau_hours", "latent_memory_tau_hours"):
+            if name in config_dict:
+                config_dict[name] = tuple(config_dict[name])
         config = ClosureConfig(**config_dict)
         metadata = json.loads(checkpoint["metadata"].item())
         template = init_params(jax.random.PRNGKey(0), config)

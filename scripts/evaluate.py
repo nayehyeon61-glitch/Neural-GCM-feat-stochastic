@@ -21,7 +21,7 @@ from ngcm_memory.features import SpatialHistory, thermal_with_empty_spatial
 from ngcm_memory.metrics import aggregate_window_metrics, forecast_metrics
 from ngcm_memory.neuralgcm_adapter import NeuralGCMMemoryAdapter
 from ngcm_memory.training import (
-    evaluation_origins, independent_test_start_index, load_closure_checkpoint, load_local_problem,
+    evaluation_origins, filter_spatial_origins, independent_test_start_index, load_closure_checkpoint, load_local_problem,
     rollout_ensemble, sha256_file, slice_window, validate_time_axis,
 )
 
@@ -58,6 +58,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.ensemble_size < 2 or (args.max_windows is not None and args.max_windows < 1):
         p.error("ensemble-size >= 2 and max-windows >= 1 required")
     params, config, trained = load_closure_checkpoint(args.closure)
+    # Schema, rather than an evaluation switch, selects the training recipe.
+    # Older checkpoints omit latent_dim and restore its legacy default of 0.
+    recurrent = config.latent_dim > 0
     if sha256_file(args.base_checkpoint) != trained.get("base_checkpoint_sha256"):
         p.error("Base checkpoint differs from the frozen checkpoint used in training")
     base, dataset, inputs, forcings = load_local_problem(
@@ -72,6 +75,8 @@ def main(argv: list[str] | None = None) -> None:
     start_index = independent_test_start_index(dataset.time.values, trained, args.start_time)
     origins = evaluation_origins(len(dataset.time), warmup, args.horizon_steps, start_index, args.stride)
     trained_history = trained.get("spatial_history")
+    if recurrent and not trained_history:
+        p.error("Recurrent checkpoint lacks the source-history initialization metadata")
     if bool(trained_history) != bool(args.spatial_history):
         p.error("Supply --spatial-history exactly when the trained checkpoint used source history")
     history = SpatialHistory.from_npz(args.spatial_history, base) if args.spatial_history else None
@@ -88,7 +93,8 @@ def main(argv: list[str] | None = None) -> None:
     if history:
         if history_steps is None or history_steps < 1:
             p.error("spatial-history-steps must be positive")
-        origins, history_filter = history.filter_origins(dataset.time.values, origins, history_steps)
+        origins, history_filter = filter_spatial_origins(
+            history, dataset.time.values, origins, history_steps, recurrent=recurrent)
         if history_filter["rejected_windows"]:
             print(json.dumps({"spatial_history_filter": "evaluation", **history_filter}), file=sys.stderr, flush=True)
         if not len(origins):
@@ -96,12 +102,12 @@ def main(argv: list[str] | None = None) -> None:
     origins = origins[:args.max_windows]
     if not len(origins):
         p.error("No eligible held-out forecast windows")
-    features = thermal_with_empty_spatial(base, history.feature_dim, trained["feature_scale_kelvin"]) if history else None
+    features = thermal_with_empty_spatial(base, history.feature_dim, trained["feature_scale_kelvin"]) if history and not recurrent else None
     adapter = NeuralGCMMemoryAdapter(
         base, config, features, feature_scale_kelvin=trained["feature_scale_kelvin"],
         enabled=not args.baseline, remove_global_mean=trained["remove_global_mean"],
     )
-    initializer = history.initializer(config) if history else None
+    initializer = (history.transition_initializer(config) if recurrent else history.initializer(config)) if history else None
     variables = tuple(trained["variables"])
 
     @jax.jit
@@ -121,7 +127,8 @@ def main(argv: list[str] | None = None) -> None:
         # matched initialization seeds when comparing the same origin dates.
         stamp = int(dataset.time.values[origin].astype("datetime64[s]").astype(np.int64))
         key = jax.random.fold_in(jax.random.PRNGKey(args.seed), stamp & 0xFFFFFFFF)
-        context = history.context(dataset.time.values[origin], history_steps) if history else None
+        context = ((history.transition_context if recurrent else history.context)(dataset.time.values[origin], history_steps)
+                   if history else None)
         predictions = predict(x, forcing, jax.random.split(key, args.ensemble_size), context)
         for name in variables:
             prediction = np.asarray(predictions[name])
@@ -146,6 +153,9 @@ def main(argv: list[str] | None = None) -> None:
         "lead_hours": (np.arange(1, args.horizon_steps + 1) * hours).tolist(),
         "spatial_history": history.metadata if history else None,
         "spatial_history_steps": history_steps,
+        "spatial_mode": ("recurrent" if recurrent else "initialization") if history else "none",
+        "future_source_latents_used": False,
+        "latent_loss_weight_at_training": trained.get("latent_loss_weight", 0.),
         "score_notes": "crps scores the empirical ensemble; fair_crps is its iid finite-member unbiased counterpart. Equal pressure-level weighting; exact Gaussian-grid spatial quadrature. RMSE/spread pooled across windows. Native variable units.",
         "metrics": {name: aggregate_window_metrics(windows) for name, windows in collected.items()},
     }
