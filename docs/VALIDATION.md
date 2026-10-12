@@ -3,6 +3,47 @@
 Validated in the implementation session of 2026-10-12. These results establish
 code behavior, not weather/climate skill.
 
+## KAI stage integration (v0.3, 2026-10-12)
+
+After the optional stage-guidance integration, the full suite completed with
+**213 passed** in 40.87 seconds on CPU. Fourteen warnings were upstream
+NumPy/NetCDF4 and Optax deprecations. Environment: Python 3.12,
+Torch 2.14.1+cpu, JAX/JAXlib 0.11.2, NeuralGCM 1.2.2, Dinosaur 1.5.0.
+
+New coverage includes both stage modes, exact disabled/zero-correction KAI
+equivalence, per-element feature bounds, physical/latent guide influence,
+terminal multi-step gradients through a frozen backbone, safe original/DDP
+checkpoint loading (including the original YAML ScalarFloat optimizer
+metadata), explicit pressure and grid/axis matching, persistent boundaries,
+generator state continuity, and unchanged generator RNG during stage reuse.
+
+Exporter tests exercise the actual guide bridge and archive reader with a
+small fake physical adapter, checking that changed future physical/KAI labels
+or future forcings cannot change generated guides. Forecast-only archives
+work beyond the last observed timestamp. Malformed temporal bounds, negative
+warmup metadata, mismatched intervals, and missing exact origins are rejected.
+Training tests include one optimizer epoch, validation selection, safe
+checkpoint roundtrip, target-free prediction CLI, temporal cutoff exclusion,
+generator identity checks and a pretrained KAI lead-interval contract.
+
+Separately, `scripts/smoke_kai.py --real-neuralgcm` ran **two actual native
+NeuralGCM steps** with the official bundled TL63 toy fixture. Its decoded
+temperature and recurrent latent were passed through the real regridding
+bridge into all four KAI stages. The final `[1,3,8,16]` forecast was finite;
+disabled adapters matched the backbone exactly; the adapter gradient norm
+was approximately **1.8038963**, with no frozen-backbone parameter gradients.
+
+The fixture used random closure/KAI parameters and a synthetic initial latent,
+so it validates integration only. No production model was trained, and no
+weather skill, physical conservation, ensemble calibration, GPU throughput,
+or long-term climate improvement was established. The generator-to-KAI bridge
+is explicitly frozen; cross-framework gradients are not implemented.
+
+The vendored KAI backbone is byte-identical to the uploaded `src/models.py`:
+SHA-256 `ee8d76d6f2890ea01d834935f51a808f767f94e359da4331af89d2e79f986325`.
+Its BSD terms are retained in `THIRD_PARTY_NOTICES.md` and included in the
+package distribution. Editable installation of v0.3.0 was also verified.
+
 ## Environment
 
 Linux CPU; Python 3.12.14, NeuralGCM 1.2.2, Dinosaur 1.5.0, JAX/JAXlib 0.11.2,
