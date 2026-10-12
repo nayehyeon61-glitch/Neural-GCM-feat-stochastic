@@ -13,6 +13,43 @@ NeuralGCM toy fixture is used only to validate integration.
 
 [한국어 실행 안내](docs/GUIDE_KO.md) · [Recurrent latent 구현 설명](docs/RECURRENT_LATENT_KO.md) · [Equations and scope](docs/DESIGN.md) · [이전 버전 점검](docs/MEMORY_AUDIT_KO.md)
 
+## Optional KAI stage manifold correction (v0.3)
+
+An additional PyTorch path now attaches independent correction adapters after
+any of KAI-Atmos's four **full-resolution** stages. The original KAI backbone
+is preserved, including its `downsample_layers` parameter names and stride-1
+transitions. The existing JAX NeuralGCM training/forecast path is unchanged.
+
+The real recurrent NeuralGCM generator advances once per physical forecast
+interval and ensemble member. Its decoded pressure-temperature forecast and
+carried stochastic latent are regridded explicitly and shared by all stage
+adapters at that lead. CNN stage depth does **not** advance the physical clock
+or resample noise. Modes are bounded learned `residual` correction and
+`filter` nudging toward a learned guide lift; stage physical readouts have an
+optional alignment objective.
+
+This first integration uses a **frozen JAX guide generator** and trainable
+PyTorch KAI adapters (optionally the backbone). NumPy guide export deliberately
+breaks cross-framework autograd. It is not joint optimization of NeuralGCM
+and KAI, nor a hard conservation/PDE projection. Physical guidance is currently
+temperature-only; the full recurrent source latent is also supplied.
+
+See **[KAI stage 구조·학습·실행 안내](docs/KAI_STAGE_MANIFOLD_KO.md)** for exact
+interfaces, data preparation, temporal splits, original checkpoint loading,
+and baseline/stage/noise ablations.
+
+```bash
+python -m pip install -e '.[kai,test]'
+python scripts/smoke_kai.py
+# Actual bundled toy NeuralGCM -> guide -> four KAI stages (CPU integration):
+JAX_PLATFORMS=cpu python scripts/smoke_kai.py --real-neuralgcm
+```
+
+No trained guide or KAI checkpoint is included. The smoke test uses explicitly
+synthetic/untrained components and validates interfaces, not weather skill.
+The vendored KAI file retains its upstream BSD license in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ![Recurrent manifold training architecture](docs/figures/recurrent_manifold_training.png)
 
 ## What is implemented
