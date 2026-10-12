@@ -1,0 +1,6 @@
+[submodule "upstream/neuralgcm"]
+	path = upstream/neuralgcm
+	url = https://github.com/neuralgcm/neuralgcm.git
+[submodule "upstream/climate_manifold"]
+	path = upstream/climate_manifold
+	url = https://github.com/nayehyeon61-glitch/climate_manifold.git
