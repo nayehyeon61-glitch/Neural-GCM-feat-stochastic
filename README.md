@@ -1,0 +1,113 @@
+# NeuralGCM + spatial statistical memory
+
+An executable research baseline combining the **real pretrained NeuralGCM
+forecast recurrence** with a learned, causal memory closure. Climate Manifold
+spatial statistics can initialize that memory from observations **strictly
+before** a forecast origin.
+
+**Status:** implementation and numerical/interface validation, not a trained
+weather model or demonstrated climate improvement. No trained Climate Manifold
+weights or production NeuralGCM checkpoint are included. The official bundled
+NeuralGCM toy fixture is used only to validate integration.
+
+[한국어 설계와 실행 안내](docs/GUIDE_KO.md) · [Memory 구조와 코드 점검](docs/MEMORY_AUDIT_KO.md) · [Equations and scope](docs/DESIGN.md)
+
+## What is implemented
+
+- Preserve NeuralGCM's pretrained learned physics and semi-implicit dynamical
+  core. Apply an operator-split temperature correction once per accepted
+  internal timestep, with explicit Kelvin/non-dimensional conversion.
+- Multiscale exponential memory and an augmented Ornstein–Uhlenbeck SDE.
+  Sample the **joint OU endpoint and time integral**, including their covariance.
+- Exact JAX port of the source spatial encoder, preserving its trained
+  normalization, field order, optional information encoder and variable fusion.
+- Causal observed-spatial-history initialization. Forecast-time memory is driven
+  by native temperature variations; unavailable surface diagnostics are never
+  replaced with lowest-model-level fields.
+- Frozen-base differentiable multi-step training, temporal split, ensemble CRPS,
+  RMSE, spread, bias and mean-drift evaluation. Explicit base-only comparison.
+
+This is **not** a wholesale replacement of the dynamical-core ODE integrator.
+NeuralGCM already has stochastic variants. The experiment is whether additional
+statistical memory improves an existing hybrid physical model.
+
+## Install and validate
+
+```bash
+git clone --recurse-submodules https://github.com/nayehyeon61-glitch/Neural-GCM-feat-stochastic.git
+cd Neural-GCM-feat-stochastic
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[test,export,netcdf]'
+python -m pytest -q
+python scripts/smoke_neuralgcm.py
+```
+
+The smoke script executes the official NeuralGCM toy checkpoint, checks exact
+base-only equivalence, and differentiates a corrected forecast. It is a CPU
+interface test, not a benchmark. A machine's working GPU JAX installation can be
+used for training; GPU execution is not part of the local validation report.
+
+The submodules are reference source checkouts, not competing Python installs:
+
+| Source | Pinned revision | Use |
+|---|---|---|
+| `neuralgcm/neuralgcm` | `c91d2007ca37a4c0842f3ff83256d32e1ec30815` (`v1.2.2`) | Matching supported runtime API |
+| `nayehyeon61-glitch/climate_manifold` | `bd1592fe9283f650b5b1f62deb7e196743b9db9a` | Latest reviewed spatial encoder architecture |
+
+`pyproject.toml` pins NeuralGCM 1.2.2 and Dinosaur 1.5.0. Current NeuralGCM main
+was also inspected, but its developing 1.2.3 API is not the supported runtime.
+Upstream licenses remain in the submodules. Official pretrained NeuralGCM
+weights have their own CC BY-SA 4.0 license; source checkpoints are not copied
+or relicensed here.
+
+## Run with actual data
+
+See `python scripts/<script>.py --help` for exact arguments.
+
+1. Obtain an official, trusted NeuralGCM checkpoint and your training data.
+   `prepare_neuralgcm_data.py` maps standard ERA5 names and conservatively
+   regrids a global field onto that checkpoint's data grid. All required
+   pressure levels, SST and sea ice must be provided. Missing physical fields
+   are errors. Inputs are read only.
+2. Train/evaluate the native thermal-memory baseline with `train.py` and
+   `evaluate.py`. Future boundary fields default to persistence. `observed`
+   boundary mode is explicitly an observed-boundary hindcast.
+3. For source statistical memory, export your actual spatial checkpoint with
+   `export_spatial.py`, prepare past observed source fields with
+   `prepare_spatial_history.py`, and pass `--spatial-history` to train/evaluate.
+   Train the source encoder and its normalizations on training data only.
+
+There is no silently generated source checkpoint. The source repository has
+code but no tracked trained weights. Its usual surface inputs are
+`msl,t2m,u10,v10`; those are not interchangeable with NeuralGCM sigma-level
+temperature/wind or surface pressure. The pre-origin-history route makes a
+valid connection without that substitution.
+
+## Files
+
+| File | Responsibility |
+|---|---|
+| `src/ngcm_memory/closure.py` | Exact auxiliary memory/OU integration |
+| `src/ngcm_memory/neuralgcm_adapter.py` | Real NeuralGCM state, units, and spectral correction |
+| `src/ngcm_memory/spatial.py` | Exact source encoder JAX inference/export |
+| `src/ngcm_memory/features.py` | Causal source history and explicit latent regridding |
+| `src/ngcm_memory/training.py` | Corrected forecast recurrence, optimizer, checkpoint I/O |
+| `src/ngcm_memory/metrics.py` | Probabilistic and drift metrics |
+| `scripts/` | Data preparation, export, training, evaluation, smoke validation |
+
+## Evaluation before claiming an improvement
+
+Train independent base/memory/noise/full ablations with the same temporal
+partitions, forcing policy, resolution, forecast starts and ensemble size.
+Compare native-temperature memory against spatial-initialized memory. Keep
+source encoder selection/normalization independent of the held-out period.
+Use multiple seeds and report lead-dependent CRPS/RMSE/spread and climate
+mean/variance, spectra and budget drift over longer runs. The supplied metrics
+cover the initial forecast/bias comparison; climate spectra and complete
+physical budget diagnostics require additional experiment-specific analysis.
+
+Temperature-only corrections do not enforce moist-energy conservation, do not
+provide an ocean/land model, and do not prove out-of-distribution climate skill.
+Base diagnostic fields are not recomputed by the outer correction; do not use
+them as closure-consistent precipitation or energy diagnostics.
